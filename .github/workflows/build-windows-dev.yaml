@@ -1,4 +1,4 @@
-name: build-windows-dev
+﻿name: build-windows-dev
 
 on:
   workflow_dispatch:
@@ -21,17 +21,22 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Install ninja + ccache
+      - name: Install ninja
         shell: pwsh
         run: |
-          choco install -y --no-progress ninja ccache
-          if (Get-Command ccache -ErrorAction SilentlyContinue) {
-            ccache -o cache_dir="${{ github.workspace }}\.ccache"
-          }
+          choco install -y --no-progress ninja
 
-      # CPU-only llama.cpp payload (windows-amd64).
-      # Mirrors the CPU branch of the upstream release.yaml windows-depends job.
-      - name: Build llama.cpp CPU payload (amd64)
+      - name: Install CUDA 12.8 toolkit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Invoke-WebRequest -Uri "https://developer.download.nvidia.com/compute/cuda/12.8.0/local_installers/cuda_12.8.0_571.96_windows.exe" -OutFile "cuda_install.exe"
+          Start-Process -FilePath .\cuda_install.exe -ArgumentList @('-s','cudart_12.8','nvcc_12.8','cublas_12.8','cublas_dev_12.8') -NoNewWindow -Wait
+          $cudaPath = (Resolve-Path "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\*").Path
+          echo "$cudaPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build llama.cpp payloads (cpu + cuda12)
         shell: pwsh
         env:
           CMAKE_GENERATOR: Ninja
@@ -40,12 +45,16 @@ jobs:
           Import-Module "$vs\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
           Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -no_logo'
           ./scripts/build_windows.ps1 cpu
+          if ($LASTEXITCODE -ne 0) { throw "cpu build failed" }
+          ./scripts/build_windows.ps1 cuda12
+          if ($LASTEXITCODE -ne 0) { throw "cuda12 build failed" }
 
-      - name: Verify CPU payload
+      - name: Verify payloads
         shell: bash
         run: |
           set -euo pipefail
-          [ -f dist/windows-amd64/lib/ollama/llama-server.exe ] || { echo "missing payload"; exit 1; }
+          [ -f dist/windows-amd64/lib/ollama/llama-server.exe ] || { echo "missing llama-server.exe"; exit 1; }
+          [ -f dist/windows-amd64/lib/ollama/cuda_v12/ggml-cuda.dll ] || { echo "missing cuda_v12 payload"; exit 1; }
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -57,8 +66,6 @@ jobs:
             MLX_VERSION
             MLX_C_VERSION
 
-      # cgo on Windows needs a clang-based gcc (llvm-mingw). Same as upstream
-      # windows-build job.
       - name: Install llvm-mingw (gcc -> clang)
         shell: pwsh
         run: |
