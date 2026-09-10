@@ -647,6 +647,10 @@ func FromResponsesRequest(r ResponsesRequest) (*api.ChatRequest, error) {
 	// Convert tools from Responses API format to api.Tool format
 	var tools []api.Tool
 	for _, t := range r.Tools {
+		// Drop tool declarations the runner cannot express (see helper below).
+		if !runnerSupportedTool(t) {
+			continue
+		}
 		tool, err := convertTool(t)
 		if err != nil {
 			return nil, err
@@ -673,6 +677,30 @@ func FromResponsesRequest(r ResponsesRequest) (*api.ChatRequest, error) {
 		Format:   format,
 		Think:    think,
 	}, nil
+}
+
+// runnerSupportedTool reports whether a Responses tool declaration can be
+// handed to the local runner (chat-template function calling).
+//
+// Two shapes Codex sends cannot:
+//   - {"type":"web_search"}   : no name at all. Ollama's tool-name mapping then
+//     returns every function_call with an empty name (template-parsed models),
+//     which Codex rejects with "unsupported call:" and the model retries
+//     forever. gpt-oss hid this because it uses Ollama's native parser.
+//   - {"type":"namespace", ...}: Codex sub-agent container; llama.cpp rejects
+//     the whole tools array ("Failed to parse tools: Unsupported tool type").
+//
+// Neither carries a callable schema, so dropping them is lossless for the model.
+func runnerSupportedTool(t ResponsesTool) bool {
+	if strings.TrimSpace(t.Name) == "" {
+		return false // nameless: breaks Ollama's tool-call name mapping
+	}
+	switch t.Type {
+	case "function", "custom":
+		return true
+	default:
+		return false // e.g. "namespace"/"web_search": rejected by llama.cpp
+	}
 }
 
 func convertTool(t ResponsesTool) (api.Tool, error) {
