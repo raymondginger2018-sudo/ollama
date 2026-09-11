@@ -155,11 +155,12 @@ func (ResponsesInputMessage) responsesInputItem() {}
 
 // ResponsesFunctionCall represents an assistant's function call in conversation history.
 type ResponsesFunctionCall struct {
-	ID        string `json:"id,omitempty"` // item ID
-	Type      string `json:"type"`         // always "function_call"
-	CallID    string `json:"call_id"`      // the tool call ID
-	Name      string `json:"name"`         // function name
-	Arguments string `json:"arguments"`    // JSON arguments string
+	ID        string `json:"id,omitempty"`        // item ID
+	Type      string `json:"type"`                // always "function_call"
+	CallID    string `json:"call_id"`             // the tool call ID
+	Name      string `json:"name"`                // function name
+	Namespace string `json:"namespace,omitempty"` // set for namespaced (MCP) tools
+	Arguments string `json:"arguments"`           // JSON arguments string
 }
 
 func (ResponsesFunctionCall) responsesInputItem() {}
@@ -427,6 +428,14 @@ type ResponsesTool struct {
 	Description *string        `json:"description"` // nullable but required
 	Strict      *bool          `json:"strict"`      // nullable but required
 	Parameters  map[string]any `json:"parameters"`  // nullable but required
+
+	// Namespace containers (e.g. Codex's MCP servers) nest their callable
+	// tools here instead of giving an inline schema. A chat-template runner
+	// cannot express that shape, so FromResponsesRequest flattens each nested
+	// tool into a plain function named "<namespace>__<tool>" (see
+	// expandNamespaceTool); the response converters map the flat name back to
+	// a {name, namespace} function_call item.
+	Tools []ResponsesTool `json:"tools,omitempty"`
 }
 
 type ResponsesRequest struct {
@@ -524,10 +533,16 @@ func FromResponsesRequest(r ResponsesRequest) (*api.ChatRequest, error) {
 					return nil, fmt.Errorf("failed to parse function call arguments: %w", err)
 				}
 			}
+			name := v.Name
+			if v.Namespace != "" {
+				// Namespaced (MCP) tools are offered to the runner under their
+				// flat name, so history has to use the flat name too.
+				name = flatNamespaceToolName(v.Namespace, v.Name)
+			}
 			toolCall := api.ToolCall{
 				ID: v.CallID,
 				Function: api.ToolCallFunction{
-					Name:      v.Name,
+					Name:      name,
 					Arguments: args,
 				},
 			}
@@ -647,6 +662,16 @@ func FromResponsesRequest(r ResponsesRequest) (*api.ChatRequest, error) {
 	// Convert tools from Responses API format to api.Tool format
 	var tools []api.Tool
 	for _, t := range r.Tools {
+		// Namespace containers (Codex's MCP servers) are flattened into plain
+		// function tools so chat-template runners can express them.
+		if isNamespaceTool(t) {
+			expanded, err := expandNamespaceTool(t)
+			if err != nil {
+				return nil, err
+			}
+			tools = append(tools, expanded...)
+			continue
+		}
 		// Drop tool declarations the runner cannot express (see helper below).
 		if !runnerSupportedTool(t) {
 			continue
@@ -682,15 +707,15 @@ func FromResponsesRequest(r ResponsesRequest) (*api.ChatRequest, error) {
 // runnerSupportedTool reports whether a Responses tool declaration can be
 // handed to the local runner (chat-template function calling).
 //
-// Two shapes Codex sends cannot:
-//   - {"type":"web_search"}   : no name at all. Ollama's tool-name mapping then
-//     returns every function_call with an empty name (template-parsed models),
-//     which Codex rejects with "unsupported call:" and the model retries
-//     forever. gpt-oss hid this because it uses Ollama's native parser.
-//   - {"type":"namespace", ...}: Codex sub-agent container; llama.cpp rejects
-//     the whole tools array ("Failed to parse tools: Unsupported tool type").
+// One shape cannot: {"type":"web_search"} carries no name at all. Ollama's
+// tool-name mapping then returns every function_call with an empty name
+// (template-parsed models), which Codex rejects with "unsupported call:" and
+// the model retries forever. gpt-oss hid this because it uses Ollama's native
+// parser.
 //
-// Neither carries a callable schema, so dropping them is lossless for the model.
+// {"type":"namespace"} containers are handled separately: FromResponsesRequest
+// flattens them into plain function tools (see expandNamespaceTool) instead of
+// dropping them, so local models can call Codex's MCP tools.
 func runnerSupportedTool(t ResponsesTool) bool {
 	if strings.TrimSpace(t.Name) == "" {
 		return false // nameless: breaks Ollama's tool-call name mapping
@@ -699,8 +724,84 @@ func runnerSupportedTool(t ResponsesTool) bool {
 	case "function", "custom":
 		return true
 	default:
-		return false // e.g. "namespace"/"web_search": rejected by llama.cpp
+		return false // e.g. "web_search": rejected by llama.cpp
 	}
+}
+
+const namespaceToolSeparator = "__"
+
+// isNamespaceTool reports whether t is a Responses namespace container
+// (Codex wraps every MCP server as one) carrying nested callable tools.
+func isNamespaceTool(t ResponsesTool) bool {
+	return t.Type == "namespace" && strings.TrimSpace(t.Name) != ""
+}
+
+// flatNamespaceToolName builds the name a chat-template runner sees for a
+// namespaced tool.
+func flatNamespaceToolName(namespace, tool string) string {
+	return namespace + namespaceToolSeparator + tool
+}
+
+// expandNamespaceTool flattens a namespace container into the plain function
+// tools a chat-template runner can express. Flat name is
+// "<namespace>__<tool>"; the response converters map it back to a
+// {name, namespace} function_call item (the only shape Codex's router accepts
+// for a namespaced tool).
+func expandNamespaceTool(t ResponsesTool) ([]api.Tool, error) {
+	var out []api.Tool
+	for _, sub := range t.Tools {
+		if sub.Type != "function" || strings.TrimSpace(sub.Name) == "" {
+			continue
+		}
+		flat := sub
+		flat.Name = flatNamespaceToolName(t.Name, sub.Name)
+		tool, err := convertTool(flat)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, tool)
+	}
+	return out, nil
+}
+
+// namespaceToolTarget resolves a name the local model produced back to the
+// Responses {namespace, name} pair. Models often drop the prefix or collapse
+// the separator, so those spellings are accepted too (when unambiguous and
+// not shadowing a real top-level tool).
+func namespaceToolTarget(request ResponsesRequest, name string) (namespace, tool string, ok bool) {
+	plain := map[string]bool{}
+	for _, t := range request.Tools {
+		if !isNamespaceTool(t) {
+			plain[t.Name] = true
+		}
+	}
+	if plain[name] {
+		return "", "", false
+	}
+	bare := map[string][2]string{}
+	ambiguous := map[string]bool{}
+	for _, t := range request.Tools {
+		if !isNamespaceTool(t) {
+			continue
+		}
+		for _, sub := range t.Tools {
+			if sub.Type != "function" || strings.TrimSpace(sub.Name) == "" {
+				continue
+			}
+			if name == flatNamespaceToolName(t.Name, sub.Name) || name == t.Name+"_"+sub.Name {
+				return t.Name, sub.Name, true
+			}
+			if _, seen := bare[sub.Name]; seen {
+				ambiguous[sub.Name] = true
+			} else {
+				bare[sub.Name] = [2]string{t.Name, sub.Name}
+			}
+		}
+	}
+	if hit, seen := bare[name]; seen && !ambiguous[name] {
+		return hit[0], hit[1], true
+	}
+	return "", "", false
 }
 
 func convertTool(t ResponsesTool) (api.Tool, error) {
@@ -896,6 +997,7 @@ type ResponsesOutputItem struct {
 	Content   []ResponsesOutputContent `json:"content,omitempty"`   // for message
 	CallID    string                   `json:"call_id,omitempty"`   // for function_call
 	Name      string                   `json:"name,omitempty"`      // for function_call
+	Namespace string                   `json:"namespace,omitempty"` // for function_call (MCP tools)
 	Arguments string                   `json:"arguments,omitempty"` // for function_call
 	Input     string                   `json:"input,omitempty"`     // for custom_tool_call
 
@@ -976,12 +1078,17 @@ func ToResponse(model, responseID, itemID string, chatResponse api.ChatResponse,
 					Input:  customToolInput(tc.Function.Arguments),
 				})
 			} else {
+				name, namespace := tc.Function.Name, ""
+				if ns, tool, ok := namespaceToolTarget(request, name); ok {
+					name, namespace = tool, ns
+				}
 				output = append(output, ResponsesOutputItem{
 					ID:        fmt.Sprintf("fc_%s_%d", responseID, i),
 					Type:      "function_call",
 					Status:    "completed",
 					CallID:    tc.ID,
-					Name:      tc.Function.Name,
+					Name:      name,
+					Namespace: namespace,
 					Arguments: string(argsJSON),
 				})
 			}
@@ -1195,13 +1302,17 @@ func (c *ResponsesStreamConverter) buildResponseObject(status string, output []a
 	var tools []any
 	if c.request.Tools != nil {
 		for _, t := range c.request.Tools {
-			tools = append(tools, map[string]any{
+			entry := map[string]any{
 				"type":        t.Type,
 				"name":        t.Name,
 				"description": t.Description,
 				"strict":      t.Strict,
 				"parameters":  t.Parameters,
-			})
+			}
+			if len(t.Tools) > 0 {
+				entry["tools"] = t.Tools
+			}
+			tools = append(tools, entry)
 		}
 	}
 	if tools == nil {
@@ -1381,28 +1492,40 @@ func (c *ResponsesStreamConverter) processToolCalls(toolCalls []api.ToolCall) []
 		argsStr := string(argsJSON)
 		fcItemID := fmt.Sprintf("fc_%d_%d", rand.Intn(999999), i)
 
+		name, namespace := tc.Function.Name, ""
+		if ns, tool, ok := namespaceToolTarget(c.request, name); ok {
+			name, namespace = tool, ns
+		}
+
 		// Store for final output (with status: completed)
 		toolCallItem := map[string]any{
 			"id":        fcItemID,
 			"type":      "function_call",
 			"status":    "completed",
 			"call_id":   tc.ID,
-			"name":      tc.Function.Name,
+			"name":      name,
 			"arguments": argsStr,
+		}
+		if namespace != "" {
+			toolCallItem["namespace"] = namespace
 		}
 		c.toolCallItems = append(c.toolCallItems, toolCallItem)
 
 		// response.output_item.added for function call
+		addedItem := map[string]any{
+			"id":        fcItemID,
+			"type":      "function_call",
+			"status":    "in_progress",
+			"call_id":   tc.ID,
+			"name":      name,
+			"arguments": "",
+		}
+		if namespace != "" {
+			addedItem["namespace"] = namespace
+		}
 		events = append(events, c.newEvent("response.output_item.added", map[string]any{
 			"output_index": c.outputIndex + i,
-			"item": map[string]any{
-				"id":        fcItemID,
-				"type":      "function_call",
-				"status":    "in_progress",
-				"call_id":   tc.ID,
-				"name":      tc.Function.Name,
-				"arguments": "",
-			},
+			"item":         addedItem,
 		}))
 
 		// response.function_call_arguments.delta
@@ -1424,14 +1547,7 @@ func (c *ResponsesStreamConverter) processToolCalls(toolCalls []api.ToolCall) []
 		// response.output_item.done for function call
 		events = append(events, c.newEvent("response.output_item.done", map[string]any{
 			"output_index": c.outputIndex + i,
-			"item": map[string]any{
-				"id":        fcItemID,
-				"type":      "function_call",
-				"status":    "completed",
-				"call_id":   tc.ID,
-				"name":      tc.Function.Name,
-				"arguments": argsStr,
-			},
+			"item":         toolCallItem,
 		}))
 	}
 
